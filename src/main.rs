@@ -3,8 +3,25 @@
 use eframe::egui;
 use uzakbaglanti::app::RemoteApp;
 
-#[tokio::main]
-async fn main() -> Result<(), eframe::Error> {
+fn main() -> Result<(), eframe::Error> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--service") {
+        uzakbaglanti::service::run_windows_service();
+        return Ok(());
+    }
+    if args.iter().any(|a| a == "--desktop-agent") {
+        uzakbaglanti::service::run_desktop_agent();
+        return Ok(());
+    }
+
+    // Yönetici yetkisi varsa arka planda UAC / Secure Desktop destek hizmetini başlat
+    std::thread::spawn(|| {
+        let _ = uzakbaglanti::service::ensure_system_service_running();
+    });
+
+    let rt = tokio::runtime::Runtime::new().expect("Tokio runtime başlatılamadı");
+    let _guard = rt.enter();
+
     let icon_bytes = include_bytes!("../assets/icon.png");
     let icon = eframe::icon_data::from_png_bytes(icon_bytes).ok();
 

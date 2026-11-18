@@ -11,6 +11,7 @@ pub struct InputInjector;
 
 impl InputInjector {
     pub fn execute(event: RemoteInput) {
+        let _ = crate::capture::switch_to_input_desktop();
         match event {
             RemoteInput::MouseMove { x, y } => {
                 let dx = (x.clamp(0.0, 1.0) * 65535.0) as i32;

@@ -539,22 +539,70 @@ async fn handle_host_connection(
     // Split WebSocket
     let (mut ws_sink, mut ws_stream) = ws.split();
 
+    // Özel OS thread'inde ekran yakalama (UAC / Secure Desktop geçişlerinde Tokio & GUI thread'inden izole)
+    let (frame_tx, mut frame_rx) = mpsc::channel::<Option<(u32, u32, Vec<u8>)>>(2);
+    let stop_capture = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_capture_clone = Arc::clone(&stop_capture);
+
+    std::thread::spawn(move || {
+        let mut agent = crate::service::DesktopAgentClient::connect();
+        let mut reconnect_tick: u32 = 0;
+
+        while !stop_capture_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            if agent.is_none() {
+                reconnect_tick = reconnect_tick.wrapping_add(1);
+                if reconnect_tick % 30 == 1 {
+                    agent = crate::service::DesktopAgentClient::connect();
+                }
+            }
+
+            let captured = if let Some(ref mut client) = agent {
+                match client.capture_frame() {
+                    Ok(frame) => Ok(frame),
+                    Err(_) => {
+                        // Pipe koptuysa veya geçici hata varsa düşüp yerel yakalamayı dene
+                        agent = None;
+                        capturer
+                            .try_capture_live_frame()
+                            .map(|f| (f.width, f.height, f.rgba))
+                    }
+                }
+            } else {
+                capturer
+                    .try_capture_live_frame()
+                    .map(|f| (f.width, f.height, f.rgba))
+            };
+
+            let send_res = match captured {
+                Ok(frame) => frame_tx.blocking_send(Some(frame)),
+                Err(_) => frame_tx.blocking_send(None),
+            };
+            if send_res.is_err() {
+                break;
+            }
+
+            std::thread::sleep(std::time::Duration::from_millis(33));
+        }
+    });
+
     // Görev A: Ekran Yakalama ve Teknisyene Gönderme
     let screen_task = tokio::spawn(async move {
         let mut last_frame_rgba = Vec::new();
+        let mut idle_ticks: u32 = 0;
 
-        loop {
-            if let Ok(frame) = capturer.capture_frame() {
+        while let Some(frame_opt) = frame_rx.recv().await {
+            if let Some((width, height, rgba)) = frame_opt {
+                idle_ticks = 0;
                 // Sadece kare değiştiyse veya ilk kare ise gönder (Bant genişliği tasarrufu)
-                let should_send = last_frame_rgba.len() != frame.rgba.len() 
-                    || last_frame_rgba.is_empty() 
-                    || !last_frame_rgba.iter().zip(&frame.rgba).all(|(a, b)| a == b);
+                let should_send = last_frame_rgba.len() != rgba.len()
+                    || last_frame_rgba.is_empty()
+                    || !last_frame_rgba.iter().zip(&rgba).all(|(a, b)| a == b);
 
                 if should_send {
-                    let compressed = lz4_flex::compress_prepend_size(&frame.rgba);
+                    let compressed = lz4_flex::compress_prepend_size(&rgba);
                     let packet = Packet::ScreenFrame {
-                        width: frame.width,
-                        height: frame.height,
+                        width,
+                        height,
                         compressed_rgba: compressed,
                     };
                     if let Ok(bin) = bincode::serialize(&packet) {
@@ -562,11 +610,38 @@ async fn handle_host_connection(
                             break;
                         }
                     }
-                    last_frame_rgba = frame.rgba;
+                    last_frame_rgba = rgba;
+                }
+            } else {
+                // UAC / Secure Desktop sırasında bağlantı kopmasın diye keepalive Ping gönder
+                idle_ticks = idle_ticks.wrapping_add(1);
+                if idle_ticks % 60 == 0 {
+                    if let Ok(bin) = bincode::serialize(&Packet::Ping) {
+                        if ws_sink.send(Message::Binary(bin)).await.is_err() {
+                            break;
+                        }
+                    }
                 }
             }
-            // ~30 FPS döngü
-            tokio::time::sleep(tokio::time::Duration::from_millis(33)).await;
+        }
+    });
+
+    // Özel OS thread'inde fare/klavye girişi (SYSTEM ajanı varsa UAC penceresine de basabilir)
+    let (raw_in_tx, raw_in_rx) = std::sync::mpsc::channel::<RemoteInput>();
+    std::thread::spawn(move || {
+        let mut agent = crate::service::DesktopAgentClient::connect();
+        while let Ok(input_event) = raw_in_rx.recv() {
+            if agent.is_none() {
+                agent = crate::service::DesktopAgentClient::connect();
+            }
+            if let Some(ref mut client) = agent {
+                if client.send_input(input_event.clone()).is_err() {
+                    agent = None;
+                    InputInjector::execute(input_event);
+                }
+            } else {
+                InputInjector::execute(input_event);
+            }
         }
     });
 
@@ -578,7 +653,9 @@ async fn handle_host_connection(
                     if let Ok(packet) = bincode::deserialize::<Packet>(&bin) {
                         match packet {
                             Packet::Input(input_event) => {
-                                InputInjector::execute(input_event);
+                                if raw_in_tx.send(input_event).is_err() {
+                                    break;
+                                }
                             }
                             Packet::Disconnect => break,
                             _ => {}
@@ -594,6 +671,7 @@ async fn handle_host_connection(
         _ = screen_task => {},
         _ = input_task => {},
     }
+    stop_capture.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let _ = session_tx.send(false).await;
     Ok(())
