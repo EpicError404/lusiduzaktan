@@ -1,0 +1,42 @@
+name: Release Build
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release archive
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $staging = "release_pkg"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          Copy-Item "target\release\lusid.exe" "$staging\lusid.exe"
+          Copy-Item "lusid.exe.manifest" "$staging\lusid.exe.manifest"
+          Copy-Item "cloudflared.exe" "$staging\cloudflared.exe"
+          Copy-Item "README.md" "$staging\README.md"
+          Compress-Archive -Path "$staging\*" -DestinationPath "Lusid-$tag-Windows-x64.zip" -Force
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            target/release/lusid.exe
+            Lusid-${{ github.ref_name }}-Windows-x64.zip
